@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+from asyncio.subprocess import Process
 import collections
 import hashlib
 import http.server
@@ -10,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from typing import Any, Callable
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -35,7 +37,7 @@ TOKEN_FILE = Path.home() / ".minerva-dpn" / "token"
 TEMP_DIR = Path.home() / ".minerva-dpn" / "tmp"
 MAX_RETRIES = 3
 RETRY_DELAY = 5
-ARIA2C_SIZE_THRESHOLD = 5 * 1024 * 1024  # skip aria2c for files < 5 MB
+ARIA2C_SIZE_THRESHOLD = 1 * 1024 * 1024  # skip aria2c for files < 1 MB
 QUEUE_PREFETCH = 2                       # queue depth = concurrency * this
 HISTORY_LINES = 5                        # completed jobs shown above active table
 
@@ -111,7 +113,44 @@ def do_login(server_url: str) -> str:
 HAS_ARIA2C = shutil.which("aria2c") is not None
 
 
-async def download_file(url: str, dest: Path, aria2c_connections: int = 16, known_size: int = 0, pre_allocation: str = "prealloc") -> None:
+def parse_aria2(filename: Path) -> dict[str, Any]:
+    with open(filename, "rb") as fp:
+        fp.read(2)  # version
+        fp.read(4)  # ext
+        infohashlength = int.from_bytes(fp.read(4), byteorder="big", signed=False)
+        fp.read(infohashlength)
+
+        piece_length = int.from_bytes(fp.read(4), byteorder="big", signed=False)
+        total_length = int.from_bytes(fp.read(8), byteorder="big", signed=False)
+        fp.read(8)  # upload_length
+        bitfield_length = int.from_bytes(fp.read(4), byteorder="big", signed=False)
+        bitfield = fp.read(bitfield_length)
+        downloaded_chunks = int.from_bytes(bitfield, "big").bit_count()
+
+        return {
+            "filename": filename,
+            "total_length": total_length,
+            "downloaded_length": downloaded_chunks * piece_length,
+            "total_chunks": bitfield_length * 8,
+            "downloaded_chunks": downloaded_chunks,
+        }
+
+
+async def aria2_progress(filename: Path, proc: Process, on_progress: Callable[[int, int], int] | None = None) -> None:
+    try:
+        while proc.returncode is None:
+            try:
+                data = parse_aria2(filename.with_suffix(f"{filename.suffix}.aria2"))
+                if on_progress:
+                    on_progress(data["downloaded_length"], data["total_length"])
+                await asyncio.sleep(1)
+            except FileNotFoundError:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
+async def download_file(url: str, dest: Path, aria2c_connections: int = 16, known_size: int = 0, pre_allocation: str = "prealloc", on_progress=None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     use_aria2c = HAS_ARIA2C and (known_size == 0 or known_size >= ARIA2C_SIZE_THRESHOLD)
     if use_aria2c:
@@ -128,13 +167,19 @@ async def download_file(url: str, dest: Path, aria2c_connections: int = 16, know
             "--console-log-level=warn",
             "--retry-wait=3",
             "--max-tries=5",
-            "--timeout=60",
+            "--timeout=120",
             "--connect-timeout=15",
+            "--continue",
             url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        aria2_controller = asyncio.create_task(aria2_progress(dest, proc, on_progress))
+        try:
+            _, stderr = await proc.communicate()
+        finally:
+            aria2_controller.cancel()
+            await asyncio.gather(aria2_controller, return_exceptions=True)
         if proc.returncode != 0:
             raise RuntimeError(f"aria2c exit {proc.returncode}: {stderr.decode()[:200]}")
     else:
@@ -457,7 +502,10 @@ async def process_job(
         try:
             # Download
             display.job_update(file_id, "DL")
-            await download_file(url, local_path, aria2c_connections, known_size, pre_allocation)
+            await download_file(
+                url, local_path, aria2c_connections, known_size, pre_allocation,
+                on_progress=lambda done, size: display.job_update(file_id, "DL", size=size, done=done)
+            )
             file_size = local_path.stat().st_size
             # Upload
             display.job_update(file_id, "UL", size=file_size)
@@ -518,7 +566,7 @@ async def worker_loop(
     console.print(f"Concurrency:   {concurrency}")
     console.print(f"Retries:       {MAX_RETRIES}")
     console.print(f"Keep files:    {'yes' if keep_files else 'no'}")
-    console.print(f"Downloader:    {f'aria2c ({aria2c_connections} conns/job), httpx if file <5MB' if HAS_ARIA2C else 'httpx'}")
+    console.print(f"Downloader:    {f'aria2c ({aria2c_connections} conns/job), httpx if file <{ARIA2C_SIZE_THRESHOLD // (1024*1024)}MB' if HAS_ARIA2C else 'httpx'}")
     console.print()
 
     temp_dir.mkdir(parents=True, exist_ok=True)
