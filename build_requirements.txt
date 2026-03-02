@@ -1,0 +1,2 @@
+cx_Freeze
+python-msilib; python_version >= '3.13' and sys_platform == 'win32'

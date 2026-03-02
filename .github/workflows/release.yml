@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Refresh system packages
+        run: sudo apt -y autoremove --purge snapd && sudo apt-mark hold snapd && sudo apt update && DEBIAN_FRONTEND=noninteractive sudo apt -y upgrade
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Prepare build dependencies
+        run: |
+          mkdir -pv thirdparty/aria2
+          printf "This folder is where you would put your aria2c executable... if you had one.\n\nThe worker should be able to find aria2c installed in your system if it's in your path, and will prefer using it\nso this folder is only really useful if you want to use a portable version instead." > thirdparty/aria2/README
+          python -m pip install -U pip wheel
+          pip install -r requirements.txt
+          pip install -r build_requirements.txt
+      - name: Build
+        run: |
+          python setup.py build
+          tar -cJvf Minerva-Worker-${{ github.ref_name }}-linux-x86_64.tar.xz -C build/* .
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Minerva-Worker-${{ github.ref_name }}-linux-x86_64.tar.xz
+  windows-x86_64:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Prepare build dependencies
+        run: |
+          python -m pip install -U pip wheel
+          pip install -r requirements.txt
+          pip install -r build_requirements.txt
+      - name: Fetch aria2
+        run: |
+          md thirdparty/aria2
+          curl -L -o aria2.zip "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
+          tar --strip-components 1 -xvf aria2.zip -C thirdparty\aria2
+          del aria2.zip
+      - name: Build portable
+        run: |
+          python setup.py build
+          tar --strip-components 2 -acvf Minerva-Worker-${{ github.ref_name }}-win-x86_64.zip -C build .
+      - name: Build installer
+        run: |
+          python setup.py bdist_msi
+          move dist\*.msi Minerva-Worker-${{ github.ref_name }}-win-x86_64.msi
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Minerva-Worker-${{ github.ref_name }}-win-x86_64.zip
+            Minerva-Worker-${{ github.ref_name }}-win-x86_64.msi
