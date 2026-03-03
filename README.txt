@@ -1,3 +1,5 @@
+⚠️ Deprecated, consider using https://github.com/rlaphoenix/minerva instead
+
 worker.py adapted from https://gist.github.com/rlaphoenix/257b7aa65adacc154d8b5fa0b035b1e8
 
 Build:
